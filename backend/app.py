@@ -90,6 +90,7 @@ from api.routes_projects import router as projects_router
 from api.routes_settings import router as settings_router, load_api_keys_into_env
 from api.routes_screenplay import router as screenplay_router
 from api.routes_previs import router as previs_router
+from api.routes_agent import router as agent_router
 
 # Load saved API keys into env before drivers are initialized
 load_api_keys_into_env()
@@ -106,3 +107,4 @@ app.include_router(export_router, prefix="/api/export", tags=["Export"])
 app.include_router(settings_router, prefix="/api/settings", tags=["Settings"])
 app.include_router(screenplay_router, prefix="/api/screenplay", tags=["Screenplay"])
 app.include_router(previs_router, prefix="/api/previs", tags=["Previs"])
+app.include_router(agent_router, prefix="/api/agent", tags=["Agent"])
