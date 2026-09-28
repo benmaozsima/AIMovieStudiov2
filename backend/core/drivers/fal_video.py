@@ -61,7 +61,9 @@ class FalVideoDriver(VideoDriver):
         "seedance": "fal-ai/seedance/v1.0/i2v",
         "seedance_2": "fal-ai/seedance/v2/i2v",
         "seedance_2_5": "fal-ai/seedance/v2.5/i2v",
-        "minimax_h3": "fal-ai/minimax-video-01",
+        # This is MiniMax Video-01 image-to-video.  Keep the legacy driver
+        # key for saved projects, but never submit to the retired endpoint.
+        "minimax_h3": "fal-ai/minimax/video-01/image-to-video",
     }
 
     def __init__(self, model_id: str = "seedance_2_5", api_key: Optional[str] = None):
@@ -83,7 +85,7 @@ class FalVideoDriver(VideoDriver):
             "seedance": "Seedance v1 (Fal.ai)",
             "seedance_2": "Seedance 2 (Fal.ai)",
             "seedance_2_5": "Seedance 2.5 (Fal.ai)",
-            "minimax_h3": "Minimax H3 (Fal.ai)",
+            "minimax_h3": "MiniMax Video-01 (Fal.ai)",
         }
         return names.get(self._model_key, f"Fal.ai ({self._model_key})")
 
@@ -130,20 +132,20 @@ class FalVideoDriver(VideoDriver):
             fal_request["tail_image_url"] = request.last_frame_path
 
         # R2V: additional reference images (subject/scene/style lock)
-        if request.reference_image_paths:
+        if request.reference_image_paths and self._model_key != "minimax_h3":
             # Fal Seedance 2/2.5 accept a list of reference image URLs
             fal_request["reference_images"] = request.reference_image_paths
 
         # R2V: motion/video reference
-        if request.reference_video_path:
+        if request.reference_video_path and self._model_key != "minimax_h3":
             fal_request["video_url"] = request.reference_video_path
 
         # R2V: audio/voice reference (MiniMax H3 voice lock)
-        if request.reference_audio_path:
+        if request.reference_audio_path and self._model_key != "minimax_h3":
             fal_request["audio_url"] = request.reference_audio_path
 
         # Camera movement → Fal camera params
-        if request.camera_movement:
+        if request.camera_movement and self._model_key != "minimax_h3":
             preset = request.camera_movement.get("preset", "static")
             intensity = request.camera_movement.get("intensity", 1.0)
             cam = FAL_CAMERA_PRESETS.get(preset, {"type": "static"})
@@ -154,9 +156,48 @@ class FalVideoDriver(VideoDriver):
         fal_request.update(request.extra_params)
         return fal_request
 
+    async def _upload_local_asset(self, path: str) -> str:
+        """Return a provider-visible URL for an asset held in the local vault.
+
+        Fal cannot resolve the application's ``/assets/...`` URLs.  Uploading
+        only files from the local vault keeps a generation request self
+        contained and avoids a misleading queued job that fails remotely.
+        """
+        if path.startswith(("https://", "http://")):
+            return path
+        if not path.startswith("/assets/"):
+            raise ValueError(f"Unsupported local reference path: {path}")
+        vault_root = Path(__file__).resolve().parents[2] / "assets"
+        local_path = (vault_root / path.removeprefix("/assets/")).resolve()
+        if vault_root not in local_path.parents or not local_path.is_file():
+            raise ValueError(f"Reference asset not found in vault: {path}")
+        return await asyncio.to_thread(fal_client.upload_file, str(local_path))
+
+    async def _provider_request(self, request: VideoGenerationRequest) -> dict:
+        """Build a Fal request after making all local reference assets public."""
+        provider_request = self._build_fal_request(request)
+        for key in ("image_url", "tail_image_url", "video_url", "audio_url"):
+            value = provider_request.get(key)
+            if isinstance(value, str) and value.startswith("/assets/"):
+                provider_request[key] = await self._upload_local_asset(value)
+        references = provider_request.get("reference_images")
+        if references:
+            provider_request["reference_images"] = [
+                await self._upload_local_asset(item) if isinstance(item, str) and item.startswith("/assets/") else item
+                for item in references
+            ]
+        return provider_request
+
     async def generate(self, request: VideoGenerationRequest) -> VideoGenerationResponse:
         job_id = str(uuid.uuid4())
-        fal_request = self._build_fal_request(request)
+        try:
+            fal_request = await self._provider_request(request)
+        except Exception as error:
+            return VideoGenerationResponse(
+                job_id=job_id,
+                status=GenerationStatus.FAILED,
+                error_message=f"Reference preflight failed: {error}",
+            )
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -195,43 +236,69 @@ class FalVideoDriver(VideoDriver):
                 error_message="Job not found in cache",
             )
 
+        # Return cached result if available
+        if "result" in job:
+            return job["result"]
+
         try:
             handle = job["handle"]
             status = await asyncio.to_thread(lambda: handle.status())
 
-            if status == "COMPLETED":
+            # fal_client returns status objects (InProgress, Completed, Queued),
+            # not plain strings. Check the type name.
+            status_name = type(status).__name__.lower()
+
+            if status_name in ("completed", "completedstatus"):
                 result = await asyncio.to_thread(lambda: handle.get())
-                video_url = None
-                if isinstance(result, dict):
-                    video_url = result.get("video", {}).get("url") or result.get("url")
-                return VideoGenerationResponse(
-                    job_id=job_id,
-                    status=GenerationStatus.COMPLETED,
-                    video_url=video_url,
-                    metadata={"provider": "fal.ai", "result": result},
-                )
-            elif status == "FAILED":
+                return self._parse_video_result(job_id, job, result)
+            elif status_name in ("failed", "failedstatus"):
+                error_msg = getattr(status, "error", "Generation failed on Fal.ai")
                 return VideoGenerationResponse(
                     job_id=job_id,
                     status=GenerationStatus.FAILED,
-                    error_message="Generation failed on Fal.ai",
+                    error_message=str(error_msg),
                 )
-            elif status == "IN_QUEUE":
+            elif status_name in ("queued", "queuedstatus"):
                 return VideoGenerationResponse(
                     job_id=job_id,
                     status=GenerationStatus.IN_QUEUE,
                 )
-            else:
+            elif status_name in ("inprogress", "inprogressstatus"):
+                # ``handle.get()`` blocks until completion.  A status endpoint
+                # must remain a fast poll, otherwise the UI appears frozen.
                 return VideoGenerationResponse(
                     job_id=job_id,
                     status=GenerationStatus.PROCESSING,
                 )
+            else:
+                try:
+                    result = await asyncio.to_thread(lambda: handle.get())
+                    return self._parse_video_result(job_id, job, result)
+                except Exception:
+                    return VideoGenerationResponse(
+                        job_id=job_id,
+                        status=GenerationStatus.PROCESSING,
+                    )
         except Exception as e:
             return VideoGenerationResponse(
                 job_id=job_id,
                 status=GenerationStatus.FAILED,
                 error_message=str(e),
             )
+
+    def _parse_video_result(self, job_id: str, job: dict, result: dict) -> "VideoGenerationResponse":
+        """Parse a Fal video result and cache it."""
+        video_url = None
+        if isinstance(result, dict):
+            video_url = result.get("video", {}).get("url") or result.get("url")
+        response = VideoGenerationResponse(
+            job_id=job_id,
+            status=GenerationStatus.COMPLETED,
+            video_url=video_url,
+            metadata={"provider": "fal.ai", "result": result},
+        )
+        job["result"] = response
+        return response
 
     async def download(self, job_id: str, output_dir: str) -> str:
         job = self._job_cache.get(job_id)
